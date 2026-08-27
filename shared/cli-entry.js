@@ -20,6 +20,8 @@ const scripts = [
   { name: 'Webplus: 保存通知及附件 (saveDoc)', value: 'webplus.zju/saveDoc.js' },
   { name: '图书馆: 查询已借阅图书并操作续借', value: 'lib.zju/bookList.js' },
   { name: '学在浙大: 查看作业和考试分数 (scores)', value: 'courses.zju/scores.js' },
+  { name: 'zdbk: 检查正式成绩 (gradeMonitor)', value: 'grade-monitor-check', script: 'zdbk.zju/gradeMonitor.js', args: ['check'] },
+  { name: 'zdbk: 持续监控正式成绩 (gradeMonitor)', value: 'grade-monitor-monitor', script: 'zdbk.zju/gradeMonitor.js', args: ['monitor'] },
   { name: 'courses.zju/materialMaintainer_init.js', value: 'courses.zju/materialMaintainer_init.js' },
   { name: 'courses.zju/materialMaintainer.js', value: 'courses.zju/materialMaintainer.js' },
   { name: '评教: 自动评教 (autojudge)', value: 'alt.zju/autojudge.js' },
@@ -36,11 +38,12 @@ async function main() {
     },
   ]);
 
-  const scriptPath = path.join(projectRoot, selectedScript);
+  const selected = scripts.find((script) => script.value === selectedScript);
+  const scriptPath = path.join(projectRoot, selected?.script || selectedScript);
 
-  console.log(`\x1b[32mStarting ${selectedScript}...\x1b[0m`);
+  console.log(`\x1b[32mStarting ${selected?.script || selectedScript}...\x1b[0m`);
 
-  const child = fork(scriptPath, [], {
+  const child = fork(scriptPath, selected?.args || [], {
     cwd: projectRoot, 
     stdio: 'inherit',
   });
