@@ -48,4 +48,47 @@ async function dingTalk(msg) {
   }
 }
 
+/**
+ * Send a Markdown message and propagate delivery failures to the caller.
+ * This strict variant is intended for workflows that must retry before
+ * marking a notification as handled.
+ */
+async function dingTalkMarkdown(msg, title = "ZJU Live Better") {
+  if (!enabled || !DINGTALK_WEBHOOK) {
+    return { sent: false, reason: "disabled" };
+  }
+
+  let url = DINGTALK_WEBHOOK;
+  if (DINGTALK_SECRET) {
+    const timestamp = Date.now();
+    const stringToSign = `${timestamp}\n${DINGTALK_SECRET}`;
+    const sign = crypto
+      .createHmac("sha256", DINGTALK_SECRET)
+      .update(stringToSign)
+      .digest("base64");
+    const signEncoded = encodeURIComponent(sign);
+    const separator = url.includes("?") ? "&" : "?";
+    url = `${url}${separator}timestamp=${timestamp}&sign=${signEncoded}`;
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      msgtype: "markdown",
+      markdown: { title, text: msg },
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const responseData = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  }
+  if (responseData.errcode) {
+    throw new Error(responseData.errmsg || `errcode ${responseData.errcode}`);
+  }
+  return { sent: true };
+}
+
+export { dingTalkMarkdown };
 export default dingTalk;

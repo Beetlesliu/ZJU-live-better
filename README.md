@@ -39,6 +39,12 @@ A collection of useful scripts helping you live better in ZJU.
 | --- | --- |
 | ☆`bookList` | 查询已借阅图书并操作续借 |
 
+### zdbk 相关（`zdbk.zju/`）
+
+| 功能 | 说明 |
+| --- | --- |
+| `gradeMonitor check` | 检查一次正式课程成绩并记录变化 |
+| `gradeMonitor monitor` | 定时监控正式成绩，变化时发送钉钉通知（具体使用细节查看脚本开头注释） |
 
 ## 反馈
 
