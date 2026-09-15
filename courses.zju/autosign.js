@@ -9,6 +9,14 @@ Decimal.set({ precision: 100 });
 const CONFIG = {
   radarAt: "ZJGD1",
   coldDownTime: 4000, // 4s
+  // ---- 数字签到：只轮询取码，不做万位爆破（见文件底部说明）----
+  numberCodePollInterval: 3000, // 轮询 number_code 的间隔
+  numberCodeDeadline: 120000, // 最长等待取码时间，超时告警
+  numberCodeEarlyWarn: 45000, // 等待多久还没码就先推送「请手动签到」
+  // ---- 限流保护：学在浙大已对 rollcall API 加频率限制 ----
+  minRequestGap: 350, // 任意两次 rollcall 请求的最小间隔
+  backoffBase: 20000, // 触发 429 后的全局暂停基准，按次翻倍
+  maxBackoff: 300000, // 全局暂停上限 5 分钟
 };
 const RadarInfo = {
   ZJGD1: [120.089136, 30.302331], //东一教学楼
@@ -29,8 +37,7 @@ const RadarInfo = {
 //      如果失败了>3次，则会尝试三点定位法
 
 // 成功率：目前【雷达点名】+【已配置了雷达地点】的情况可以100%签到成功
-//        数字点名已测试，已成功，确定远程没有限速，没有calm down，但是目前单线程，可能会有点慢，
-//        三点定位法已完成，感谢@eWloYW8
+//        数字点名改为「轮询取码」，不再爆破，原因见 batchNumberRollCall 注释
 
 // 顺便一提，经测试，radar_out_of_scope的限制是500米整
 
@@ -50,28 +57,98 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let req_num = 0;
 
-let we_are_bruteforcing = [];
+// ============================================================
+// 限流保护
+// ------------------------------------------------------------
+// 学在浙大对 rollcall 相关接口加了频率限制：短时间内请求过多会返回
+// 429 TOO MANY REQUESTS，且限制作用于【账号】而非单个 Session
+// （换 Session、换设备同样被拦）。
+//
+// 因此所有 rollcall 请求都必须经过 gate()，并在收到 429 时全局退避，
+// 否则会把整个账号打封 —— 连雷达签到一起失效。
+// ============================================================
+let lastRequestAt = 0;
+let globalPauseUntil = 0;
+let rateLimitStrikes = 0;
+
+async function gate() {
+  for (;;) {
+    const now = Date.now();
+    if (now < globalPauseUntil) {
+      await sleep(Math.min(globalPauseUntil - now, 10000));
+      continue;
+    }
+    const since = Date.now() - lastRequestAt;
+    if (since < CONFIG.minRequestGap) {
+      await sleep(CONFIG.minRequestGap - since);
+      continue;
+    }
+    lastRequestAt = Date.now();
+    return;
+  }
+}
+
+function noteRateLimited(context) {
+  rateLimitStrikes += 1;
+  const backoff = Math.min(
+    CONFIG.backoffBase * Math.pow(2, rateLimitStrikes - 1),
+    CONFIG.maxBackoff
+  );
+  globalPauseUntil = Date.now() + backoff;
+  sendBoth(
+    `[Auto Sign-in] ⚠️ 触发限流 429 @ ${context}，全局暂停 ${Math.round(
+      backoff / 1000
+    )}s（第 ${rateLimitStrikes} 次）。所有签到请求已挂起，避免账号被打封。`
+  );
+}
+
+function noteOk() {
+  rateLimitStrikes = 0;
+}
+
+// 只保留可安全外发的标量字段，避免把其他同学的姓名/学号推送到钉钉
+function summarizeRollcall(data) {
+  if (!data || typeof data !== "object") return String(data);
+  const out = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (v === null || ["string", "number", "boolean"].includes(typeof v)) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
 
 // if (false)
 (async () => {
   while (true) {
+    await gate();
     await courses
       .fetch("https://courses.zju.edu.cn/api/radar/rollcalls")
-      .then((v) => v.text())
-      .then(async (fa) => {
+      .then(async (res) => {
+        if (res.status === 429) {
+          noteRateLimited("radar/rollcalls");
+          return { rollcalls: [] };
+        }
+        if (res.status !== 200) {
+          sendBoth(`[-][Auto Sign-in] radar/rollcalls 返回 ${res.status}`);
+          return { rollcalls: [] };
+        }
+        const fa = await res.text();
         try {
-          return await JSON.parse(fa)
+          const parsed = JSON.parse(fa);
+          noteOk();
+          return parsed;
         } catch (e) {
-          sendBoth("[-][Auto Sign-in] Something went wrong: " + fa+"\nError: "+e.toString());
+          sendBoth("[-][Auto Sign-in] Something went wrong: " + fa + "\nError: " + e.toString());
+          return { rollcalls: [] };
         }
       })
-      //     .then((v) => v.json())
       .then(async (v) => {
         if (v.rollcalls.length == 0) {
           console.log(`[Auto Sign-in](Req #${++req_num}) No rollcalls found.`);
         } else {
           console.log(
-            `[Auto Sign-in](Req #${++req_num}) Found ${v.rollcalls.length} rollcalls. 
+            `[Auto Sign-in](Req #${++req_num}) Found ${v.rollcalls.length} rollcalls.
                 They are:${v.rollcalls.map(
                   (rc) => `
                   - ${rc.title} @ ${rc.course_title} by ${rc.created_by_name} (${rc.department_name})`
@@ -83,8 +160,8 @@ let we_are_bruteforcing = [];
 
           v.rollcalls.forEach((rollcall) => {
             /**
-             * It looks like 
-             * 
+             * It looks like
+             *
   {
     avatar_big_url: '',
     class_name: '',
@@ -124,13 +201,7 @@ let we_are_bruteforcing = [];
               return;
             }
             if (rollcall.is_number) {
-              if(we_are_bruteforcing.includes(rollcallId)){
-                console.log("[Auto Sign-in] We are already bruteforcing rollcall #" + rollcallId);
-                return;
-              }
-              we_are_bruteforcing.push(rollcallId);
-              sendBoth(`[Auto Sign-in] Bruteforcing new number rollcall #${rollcallId}: ${rollcall.title} @ ${rollcall.course_title} by ${rollcall.created_by_name} (${rollcall.department_name})`);
-              batchNumberRollCall(rollcallId);
+              batchNumberRollCall(rollcallId, rollcall);
               return;
             }
             // None of the above.
@@ -301,6 +372,7 @@ function solveSphereLeastSquaresDecimal(rawPoints) {
 async function answerRadarRollcall(radarXY, rid) {
 
   async function _req(lon, lat) {
+    await gate();
     return await courses.fetch(
       "https://courses.zju.edu.cn/api/rollcall/" + rid + "/answer?api_version=1.1.2",
         {
@@ -318,6 +390,10 @@ async function answerRadarRollcall(radarXY, rid) {
         headers: { "Content-Type": "application/json" }
       }
     ).then(async v => {
+      if (v.status === 429) {
+        noteRateLimited(`answer radar #${rid}`);
+        return { __rateLimited: true };
+      }
       try { return await v.json(); }
       catch (e) { console.log("[Autosign][JSON error]", e); return null; }
       });
@@ -373,127 +449,184 @@ async function answerRadarRollcall(radarXY, rid) {
 }
 
 async function answerNumberRollcall(numberCode, rid) {
-  return await courses
-    .fetch(
-      "https://courses.zju.edu.cn/api/rollcall/" +
-        rid +
-        "/answer_number_rollcall",
-      {
-        body: JSON.stringify({
-          deviceId: uuidv4(),
-          numberCode,
-        }),
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          // "X-Session-Id": courses.session,
-        },
-      }
-    )
-    .then(async(vd) => {
-      // console.log(vd.status, vd.statusText);
-      // console.log(await vd.text());
-      /*
-      When fail:
-      400 BAD REQUEST
-      {"error_code":"wrong_number_code","message":"wrong number code","number_code":"6921"}
-      When success:
-      200 OK
-      {"id":5427153,"status":"on_call"}
+  await gate();
+  const res = await courses.fetch(
+    "https://courses.zju.edu.cn/api/rollcall/" +
+      rid +
+      "/answer_number_rollcall",
+    {
+      body: JSON.stringify({
+        deviceId: uuidv4(),
+        numberCode,
+      }),
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+      },
+    }
+  );
 
-       */
+  if (res.status === 429) {
+    noteRateLimited(`answer_number #${rid}`);
+    return { ok: false, rateLimited: true, status: 429 };
+  }
 
-      
-      if (vd.status != 200 || vd.error_code?.includes("wrong")) {
-        return false;
-      }
-      return true;
-    });
+  /*
+  When fail:
+  400 BAD REQUEST
+  {"error_code":"wrong_number_code","message":"wrong number code","number_code":"6921"}
+  When success:
+  200 OK
+  {"id":5427153,"status":"on_call"}
+   */
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* 可能是空响应 */ }
+
+  if (res.status !== 200) {
+    console.log("[Autosign][answer_number] 非 200:", res.status, body);
+    return { ok: false, status: res.status, body };
+  }
+  noteOk();
+  return { ok: true, status: 200, body };
 }
 
-let currentBatchingRCs = [];
-async function batchNumberRollCall(rid) {
-  if (currentBatchingRCs.includes(rid)) return;
+// ============================================================
+// 数字签到
+// ------------------------------------------------------------
+// 历史实现是「并发爆破 0000-9999」。该做法在 2026-09 之后已不可用：
+//
+//   1. 学在浙大对 rollcall API 加了频率限制，短时间大量请求返回 429；
+//   2. 限制作用于【账号】而非 Session —— 换设备、换 Session 一样被拦，
+//      一旦打封，雷达签到会一起失效；
+//   3. 即使不被封，按限流下的安全速率跑完 1 万个码也要 4 小时以上，
+//      远超签到窗口，实际上不可能爆破成功。
+//
+// 现在改为：直接轮询 student_rollcalls 读取 number_code。
+// 每 3 秒一个请求，完全在限流阈值内。
+// 若在窗口内始终拿不到码，则推送钉钉提醒人工签到，
+// 并附上接口的真实返回以便定位（这正是诊断学校改动的关键信息）。
+// ============================================================
+const numberTasks = new Map(); // rid -> Promise，防止重复处理
+const numberWarned = new Set(); // 已推送过「请手动签到」的 rid
 
-  currentBatchingRCs.push(rid);
+async function batchNumberRollCall(rid, meta = {}) {
+  if (numberTasks.has(rid)) {
+    console.log("[Auto Sign-in] 数字签到 #" + rid + " 已在处理中");
+    return numberTasks.get(rid);
+  }
 
-  console.log(`[Auto Sign-in] 发现数字签到任务 ${rid}，等待 40 秒后执行...`);
-  await new Promise(resolve => setTimeout(resolve, 40000));
+  const task = (async () => {
+    const startedAt = Date.now();
+    const deadline = startedAt + CONFIG.numberCodeDeadline;
+    let lastSummary = null;
+    let lastStatus = null;
 
-  const state = new Map();
-  state.set("found", false);
+    console.log(`[Auto Sign-in] 数字签到 #${rid} 开始轮询签到码（每 ${CONFIG.numberCodePollInterval}ms 一次）`);
 
-  const data = await getNumberCode(rid);
-  const numberCode = data?.number_code;
+    while (Date.now() < deadline) {
+      const poll = await getNumberCode(rid);
+      lastStatus = poll.status ?? lastStatus;
+      if (poll.data) lastSummary = summarizeRollcall(poll.data);
 
-  answerNumberRollcall(numberCode, rid).then((success) => {
-    if (state.get("found")) return;
+      const rawCode = poll.data?.number_code;
+      const code =
+        rawCode === null || rawCode === undefined || String(rawCode).trim() === ""
+          ? null
+          : String(rawCode).trim().padStart(4, "0");
 
-    if (success) {
-      foundCode = numberCode;
-      state.set("found", true);
+      if (code) {
+        console.log(`[Auto Sign-in] #${rid} 取到签到码 ${code}，提交中…`);
+        const r = await answerNumberRollcall(code, rid);
+        if (r.ok) {
+          sendBoth(`[Auto Sign-in] 数字签到 #${rid} 成功，签到码 ${code}。`);
+          return;
+        }
+        if (r.rateLimited) {
+          // 已全局退避，等下轮继续
+          console.log(`[Auto Sign-in] #${rid} 提交触发限流，等待退避后重试`);
+        } else {
+          console.log(`[Auto Sign-in] #${rid} 签到码 ${code} 被拒绝：`, r.status, r.body);
+          sendBoth(
+            `[Auto Sign-in] ⚠️ 数字签到 #${rid} 取到签到码 ${code} 但提交被拒（HTTP ${r.status}）。` +
+              `可能是提交格式已变更，请手动签到。`
+          );
+          return;
+        }
+      }
+
+      // 等了一段时间还没码，先提醒人工签，别等到窗口结束
+      if (
+        !code &&
+        Date.now() - startedAt > CONFIG.numberCodeEarlyWarn &&
+        !numberWarned.has(rid)
+      ) {
+        numberWarned.add(rid);
+        sendBoth(buildManualSignMsg(rid, meta, lastSummary, lastStatus));
+      }
+
+      await sleep(CONFIG.numberCodePollInterval);
     }
+
+    if (!numberWarned.has(rid)) {
+      numberWarned.add(rid);
+      sendBoth(buildManualSignMsg(rid, meta, lastSummary, lastStatus));
+    }
+    console.log(`[Auto Sign-in] 数字签到 #${rid} 结束（未取到签到码）`, lastSummary);
+  })().finally(() => {
+    numberTasks.delete(rid);
   });
 
-  const batchSize = 200;
-  let foundCode = null;
+  numberTasks.set(rid, task);
+  return task;
+}
 
-  for (let start = 0; start <= 9999; start += batchSize) {
-
-    if (state.get("found")) break;
-
-    const end = Math.min(start + batchSize - 1, 9999);
-    const tasks = [];
-
-    for (let ckn = start; ckn <= end; ckn++) {
-      const code = ckn.toString().padStart(4, "0");
-
-      tasks.push(
-        answerNumberRollcall(code, rid).then(success => {
-          if (state.get("found")) return;
-
-          if (success) {
-            foundCode = code;
-            state.set("found", true);
-          }
-        })
-      );
+function buildManualSignMsg(rid, meta, summary, status) {
+  const lines = [
+    `[Auto Sign-in] 🚨 数字签到 #${rid} 取不到签到码，**请尽快手动签到**！`,
+    ``,
+    `课程：${meta.course_title ?? "未知"}`,
+    `时间：${meta.title ?? "未知"}`,
+    `教师：${meta.created_by_name ?? "未知"}`,
+    ``,
+    `诊断信息（供定位学校改动）：`,
+    `- student_rollcalls HTTP ${status ?? "?"}`,
+  ];
+  if (summary) {
+    for (const k of [
+      "is_number",
+      "is_radar",
+      "status",
+      "number_code",
+      "published_at",
+      "end_time",
+      "title",
+    ]) {
+      if (k in summary) lines.push(`- ${k}: ${JSON.stringify(summary[k])}`);
     }
-
-    await Promise.race([
-      Promise.all(tasks),
-      new Promise(resolve => {
-        const timer = setInterval(() => {
-          if (state.get("found")) {
-            clearInterval(timer);
-            resolve();
-          }
-        }, 20);
-      })
-    ]);
-
-    if (state.get("found")) break;
+  } else {
+    lines.push(`- 未取到响应体`);
   }
-
-  if (foundCode) {
-    sendBoth(`[Auto Sign-in] Number Rollcall ${rid} succeeded: found code ${foundCode}.`);
-  }
-  else {
-    sendBoth(`[Auto Sign-in] Number Rollcall ${rid} failed to find valid code.`);
-  }
+  return lines.join("\n");
 }
 
 async function getNumberCode(rid) {
-  return await courses
-    .fetch(
+  await gate();
+  try {
+    const res = await courses.fetch(
       "https://courses.zju.edu.cn/api/rollcall/" + rid + "/student_rollcalls",
-    )
-    .then(async (v) => {
-      try {
-        return await v.json();
-      } catch (e) {
-        console.log("[Autosign][JSON error]", e);
-        return null;
-      }
-    });
+    );
+    if (res.status === 429) {
+      noteRateLimited(`student_rollcalls #${rid}`);
+      return { rateLimited: true, status: 429 };
+    }
+    if (res.status !== 200) {
+      return { status: res.status };
+    }
+    const data = await res.json();
+    noteOk();
+    return { data, status: 200 };
+  } catch (e) {
+    console.log("[Autosign][JSON error]", e);
+    return { error: String(e) };
+  }
 }
