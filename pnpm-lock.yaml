@@ -33,8 +33,8 @@ importers:
         specifier: ^12.11.1
         version: 12.11.1
       login-zju:
-        specifier: ^1.0.6
-        version: 1.0.6
+        specifier: ^1.0.8
+        version: 1.0.8
       uuid:
         specifier: ^11.1.0
         version: 11.1.0
@@ -457,8 +457,8 @@ packages:
     resolution: {integrity: sha512-zymm5+u+sCsSWyD9qNaejV3DFvhCKclKdizYaJUuHA83RLjb7nSuGnddCHGv0hk+KY7BMAlsWeK4Ueg6EV6XQg==}
     engines: {node: '>=8'}
 
-  login-zju@1.0.6:
-    resolution: {integrity: sha512-fgrabvquOxhwPG7QOrsofpDgFrAGvUNjbunGP7FPPIWI8xWedddCbdBMFpMGm+1s/f1bb1Q2R4Onf6Scfoxlhg==}
+  login-zju@1.0.8:
+    resolution: {integrity: sha512-q0SVVO+NALTvIqOxWIhuR7ioK0qBqbq58u5zavPzq0EXjhELJ4udDipnaAvLzqxxADTcF1yCzru2FSmxzKNrYg==}
 
   math-intrinsics@1.1.0:
     resolution: {integrity: sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g==}
@@ -1078,7 +1078,7 @@ snapshots:
 
   is-fullwidth-code-point@3.0.0: {}
 
-  login-zju@1.0.6: {}
+  login-zju@1.0.8: {}
 
   math-intrinsics@1.1.0: {}
 

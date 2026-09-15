@@ -417,6 +417,9 @@ async function batchNumberRollCall(rid) {
 
   currentBatchingRCs.push(rid);
 
+  console.log(`[Auto Sign-in] 发现数字签到任务 ${rid}，等待 40 秒后执行...`);
+  await new Promise(resolve => setTimeout(resolve, 40000));
+
   const state = new Map();
   state.set("found", false);
 
