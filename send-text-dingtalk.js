@@ -1,55 +1,59 @@
-import crypto from "crypto";
+/**
+ * 把文本文件的内容发到钉钉。
+ *
+ * 用法：node send-text-dingtalk.js <file>
+ *
+ * 发送失败时以非 0 退出，方便调用方（shell / systemd）感知失败。
+ */
+
 import fs from "fs";
+
 import "dotenv/config";
 
-const webhook = process.env.DINGTALK_WEBHOOK;
-const secret = process.env.DINGTALK_SECRET;
+import { dingTalkMarkdown } from "./shared/dingtalk-webhook.js";
+
 const file = process.argv[2];
 
-if (!webhook) {
-  throw new Error("DINGTALK_WEBHOOK is empty");
+if (!file) {
+  console.error("用法：node send-text-dingtalk.js <file>");
+  process.exit(2);
 }
 
-const raw = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-const content = raw.trim();
+if (!fs.existsSync(file)) {
+  console.error(`文件不存在：${file}`);
+  process.exit(2);
+}
+
+const content = fs.readFileSync(file, "utf8").trim();
 
 if (!content) {
-  console.log("No content to send.");
+  console.log("文件为空，无需发送。");
   process.exit(0);
 }
 
-let url = webhook;
+// 钉钉 markdown 上限 20000 字节，留出标题和包裹的余量
+const MAX_LEN = 1800;
 
-if (secret) {
-  const timestamp = Date.now();
-  const stringToSign = `${timestamp}\n${secret}`;
+// 截断保留**开头**：待办列表的头部是 "You have N things to do" 和最早截止的条目，
+// 恰恰是最该看的部分。旧实现用的 slice(-MAX_LEN) 把开头砍掉了，只剩尾巴。
+const body =
+  content.length > MAX_LEN
+    ? `${content.slice(0, MAX_LEN)}\n\n...（已截断，共 ${content.length} 字符）`
+    : content;
 
-  const sign = crypto
-    .createHmac("sha256", secret)
-    .update(stringToSign)
-    .digest("base64");
+const message = `### ZJU-live-better 待办提醒\n\n${body}`;
 
-  url += `&timestamp=${timestamp}&sign=${encodeURIComponent(sign)}`;
+try {
+  const result = await dingTalkMarkdown(message, "ZJU-live-better 待办提醒");
+
+  if (!result.sent) {
+    console.log(`钉钉未启用（${result.reason}），内容如下：`);
+    console.log(message);
+    process.exit(0);
+  }
+
+  console.log("已发送。");
+} catch (err) {
+  console.error(`发送失败：${err.message}`);
+  process.exit(1);
 }
-
-const maxLen = 1800;
-const message = [
-  "【ZJU-live-better 待办提醒】",
-  "",
-  content.slice(-maxLen),
-].join("\n");
-
-const res = await fetch(url, {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-  },
-  body: JSON.stringify({
-    msgtype: "text",
-    text: {
-      content: message,
-    },
-  }),
-});
-
-console.log(await res.text());
