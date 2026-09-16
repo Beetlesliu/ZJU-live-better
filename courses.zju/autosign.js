@@ -130,7 +130,8 @@ function summarizeRollcall(data) {
           return { rollcalls: [] };
         }
         if (res.status !== 200) {
-          sendBoth(`[-][Auto Sign-in] radar/rollcalls 返回 ${res.status}`);
+          // 只打日志，避免持续异常时刷屏钉钉；429 已在上面单独告警
+          console.log(`[-][Auto Sign-in] radar/rollcalls 返回 ${res.status}`);
           return { rollcalls: [] };
         }
         const fa = await res.text();
@@ -582,7 +583,7 @@ async function batchNumberRollCall(rid, meta = {}) {
 
 function buildManualSignMsg(rid, meta, summary, status) {
   const lines = [
-    `[Auto Sign-in] 🚨 数字签到 #${rid} 取不到签到码，**请尽快手动签到**！`,
+    `[Auto Sign-in] 🚨 数字签到 #${rid} 取不到签到码，请尽快手动签到！`,
     ``,
     `课程：${meta.course_title ?? "未知"}`,
     `时间：${meta.title ?? "未知"}`,
