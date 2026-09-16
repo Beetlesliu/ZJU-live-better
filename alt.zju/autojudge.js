@@ -2,11 +2,22 @@
 // 给所有待评教课程的每位教师提交满分（5/5）评价。
 // 登录与鉴权复用 login-zju 的 ALT（自动跟随重定向取 token 并注入 Bearer 头）。
 // 启动时可选择「一键全部提交」或「逐门课程确认后提交」。
+//
+// 用法：
+//   node alt.zju/autojudge.js              交互式提交
+//   node alt.zju/autojudge.js --dry-run    只列出待评教课程与教师，不提交任何内容
+//
+// ⚠️ 默认模式会**立即向学校提交**评教结果，且提交内容恒为满分——
+//    与课程实际教学质量无关。没有撤销入口。第一次使用建议先跑 --dry-run
+//    确认课程名单无误，再交互式提交。本脚本需要 TTY，请勿放进 systemd。
 
 import chalk from "chalk";
 import inquirer from "inquirer";
 import { ALT, ZJUAM } from "login-zju";
 import "dotenv/config";
+
+// 只列不提交，用于在不产生任何后果的前提下核对课程名单
+const DRY_RUN = process.argv.includes("--dry-run");
 
 const alt = new ALT(
   new ZJUAM(process.env.ZJU_USERNAME, process.env.ZJU_PASSWORD)
@@ -110,17 +121,23 @@ function teacherLabel(teacher) {
 
 async function main() {
   try {
-    const { mode } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "mode",
-        message: "请选择评教方式：",
-        choices: [
-          { name: "一键全部提交", value: "all" },
-          { name: "逐门课程确认后提交", value: "interactive" },
-        ],
-      },
-    ]);
+    let mode = "dry-run";
+    if (!DRY_RUN) {
+      const answer = await inquirer.prompt([
+        {
+          type: "list",
+          name: "mode",
+          message: "请选择评教方式：",
+          choices: [
+            { name: "一键全部提交", value: "all" },
+            { name: "逐门课程确认后提交", value: "interactive" },
+          ],
+        },
+      ]);
+      mode = answer.mode;
+    } else {
+      console.log(chalk.yellow("[AutoJudge] dry-run 模式：只列课程，不会提交任何评教。"));
+    }
 
     console.log(chalk.blue("[AutoJudge] 正在登录并获取待评教课程..."));
     const listResp = await post(getListURL, { pageNum: 0, pageSize: 20 });
@@ -215,9 +232,26 @@ async function main() {
         );
       }
 
+      if (DRY_RUN) {
+        const names = chosenTeachers
+          .map((t) => `${t.userName || t.userSid} (${t.userSid})`)
+          .join("、");
+        console.log(chalk.gray(`  将提交满分评教：${names || "(无教师)"}`));
+        continue;
+      }
+
       const r = await submitCourse(id, courseName, groupId, chosenTeachers);
       ok += r.ok;
       fail += r.fail;
+    }
+
+    if (DRY_RUN) {
+      console.log(
+        chalk.yellow(
+          `\n[dry-run] 以上为待评教清单，未提交任何内容。去掉 --dry-run 才会真正提交。`
+        )
+      );
+      return;
     }
 
     console.log(chalk.bold(`\n完成。成功 ${ok}，失败 ${fail}。`));
