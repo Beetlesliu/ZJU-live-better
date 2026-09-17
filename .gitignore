@@ -147,3 +147,10 @@ debug/
 
 # Generated quiz answer HTML files (courses.zju/quizanswer.js)
 courses.zju/QA*.html
+# 本地凭据与运行态。这些此前只写在 .git/info/exclude——那是非版本化的
+# 本地文件，重新 clone 就没了，届时一次 `git add -A` 就会把第二个账号的
+# 凭据提交进公开仓库。放进 .gitignore 才算真正挡住。
+.env.account2
+.ddl-reminder-state.json
+.new-todo-state.json
+.reminder-state.json
