@@ -1,10 +1,19 @@
-import { COURSES, ZJUAM } from "login-zju";
+import { COURSES, ZDBK, ZJUAM } from "login-zju";
 import { v4 as uuidv4 } from "uuid";
 import "dotenv/config";
 import crypto from "crypto";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import dingTalk from "../shared/dingtalk-webhook.js";
 import Decimal from "decimal.js";
+import {
+  beaconKeysForCourse,
+  beijingWeekday,
+  loadSchedule,
+} from "./classroom-schedule.js";
 Decimal.set({ precision: 100 });
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const CONFIG = {
   radarAt: "ZJGD1",
@@ -17,6 +26,14 @@ const CONFIG = {
   minRequestGap: 350, // 任意两次 rollcall 请求的最小间隔
   backoffBase: 20000, // 触发 429 后的全局暂停基准，按次翻倍
   maxBackoff: 300000, // 全局暂停上限 5 分钟
+  // ---- 课表优先：先用课表匹配出的教室，签不上再回退到全信标遍历 ----
+  scheduleEnabled: process.env.AUTOSIGN_SCHEDULE !== "false",
+  scheduleCachePath:
+    process.env.AUTOSIGN_SCHEDULE_CACHE ||
+    path.join(__dirname, "..", ".schedule-state.json"),
+  scheduleRefreshMs: Number(process.env.AUTOSIGN_SCHEDULE_REFRESH_MS || 6 * 3600 * 1000),
+  // 拉失败时的重试间隔，比刷新周期短得多——课表拿不到会退回全信标遍历（费请求但能签上）
+  scheduleRetryMs: Number(process.env.AUTOSIGN_SCHEDULE_RETRY_MS || 10 * 60 * 1000),
 };
 const RadarInfo = {
   ZJGD1: [120.089136, 30.302331], //东一教学楼
@@ -32,9 +49,12 @@ const RadarInfo = {
   YQSS: [120.124001,30.265735], //虽然大概不会有课在宿舍上但还是放一个点位
   ZJG4: [120.073427,30.299757], //紫金港大西区
 };
-// 说明: 在这里配置签到地点后，签到会优先【使用配置的地点】尝试
-//      随后会尝试遍历RadarInfo中的所有地点
-//      如果失败了>3次，则会尝试三点定位法
+// 雷达签到的尝试顺序（越靠前越省请求）：
+//   1. 【课表匹配到的教室】——查教务网课表，把上课教室映射成信标，通常第 1 次就中
+//   2. 【配置的雷达地点】CONFIG.radarAt
+//   3. 遍历 RadarInfo 中的其余全部信标
+//   4. 仍失败则三点定位
+// 见文件下方「课表优先」一节。课表拿不到时自动退化成 2→3→4，与旧行为一致。
 
 // 成功率：目前【雷达点名】+【已配置了雷达地点】的情况可以100%签到成功
 //        数字点名改为「轮询取码」，不再爆破，原因见 batchNumberRollCall 注释
@@ -118,9 +138,89 @@ function summarizeRollcall(data) {
   return out;
 }
 
+// ============================================================
+// 课表优先
+// ------------------------------------------------------------
+// 雷达签到原本是「配置地点 → 遍历全部 12 个信标 → 三点定位」，最坏 14 次请求。
+// 学在浙大加了账号级 429 限流之后，这个量级很危险。但同一门课一整个学期都在
+// 同一间教室——先查课表拿到教室、映射成信标试一次，成了就收工，通常只要 1 次。
+//
+// 课表只是优化项：任何一环失败（教务网挂了、课程名对不上、教室没映射）都必须
+// 退回原来的全信标遍历，绝不能因为课表出问题而漏签。
+// ============================================================
+let scheduleCache = null;
+let scheduleInFlight = false;
+let scheduleNextCheckAt = 0; // 下次允许碰课表的时间（正常周期 or 失败退避）
+
+async function refreshSchedule(force = false) {
+  if (!CONFIG.scheduleEnabled || scheduleInFlight) return;
+  if (!force && Date.now() < scheduleNextCheckAt) return;
+
+  scheduleInFlight = true;
+  try {
+    const zdbk = new ZDBK(
+      new ZJUAM(process.env.ZJU_USERNAME, process.env.ZJU_PASSWORD)
+    );
+    const next = await loadSchedule({
+      zdbk,
+      cachePath: CONFIG.scheduleCachePath,
+      maxAgeMs: CONFIG.scheduleRefreshMs,
+      log: (m) => console.log("[Auto Sign-in]" + m),
+    });
+    scheduleCache = next;
+    // 顺利拿到（新鲜的或刚拉的）→ 正常周期；只翻出旧缓存或彻底没拿到 → 短退避重试，
+    // 否则课前那一次失败就要等满整个刷新周期，等于这场课全废了。
+    scheduleNextCheckAt =
+      Date.now() +
+      (next && !next.stale ? CONFIG.scheduleRefreshMs : CONFIG.scheduleRetryMs);
+  } catch (err) {
+    // loadSchedule 内部已经兜过底，这里防的是 ZDBK 构造 / CAS 登录本身抛错
+    console.log(`[Auto Sign-in][课表] 初始化失败，退回全信标遍历：${err.message}`);
+    scheduleCache = null;
+    scheduleNextCheckAt = Date.now() + CONFIG.scheduleRetryMs;
+  } finally {
+    scheduleInFlight = false;
+  }
+}
+
+/**
+ * 这次雷达签到按什么顺序试地点：课表匹配到的排最前，然后是配置地点，
+ * 最后是其余全部信标兜底。重复坐标交给 answerRadarRollcall 去重。
+ */
+function radarCoordinateOrder(rollcall) {
+  const keys = [];
+  const matched = beaconKeysForCourse(
+    scheduleCache?.entries,
+    rollcall?.course_title,
+    beijingWeekday()
+  );
+
+  if (matched.length) {
+    console.log(
+      `[Auto Sign-in][课表] 「${rollcall?.course_title}」→ 优先信标 ${matched.join(", ")}`
+    );
+  } else {
+    console.log(
+      `[Auto Sign-in][课表] 「${rollcall?.course_title}」没匹配到教室，按默认顺序尝试`
+    );
+  }
+
+  keys.push(...matched);
+  if (CONFIG.radarAt) keys.push(CONFIG.radarAt);
+  keys.push(...Object.keys(RadarInfo));
+
+  return keys.map((k) => RadarInfo[k]).filter(Boolean);
+}
+
 // if (false)
 (async () => {
+  // 先把课表拉起来再进循环，否则第一节课的第一次签到用不上（那次最要紧）
+  await refreshSchedule(true);
+
   while (true) {
+    // 不 await：刷新只影响下一次签到的起点，不该拖慢轮询
+    refreshSchedule();
+
     await gate();
     await courses
       .fetch("https://courses.zju.edu.cn/api/radar/rollcalls")
@@ -198,7 +298,7 @@ function summarizeRollcall(data) {
             console.log("[Auto Sign-in] Now answering rollcall #" + rollcallId);
             if (rollcall.is_radar) {
               sendBoth(`[Auto Sign-in] Answering new radar rollcall #${rollcallId}: ${rollcall.title} @ ${rollcall.course_title} by ${rollcall.created_by_name} (${rollcall.department_name})`);
-              answerRadarRollcall(RadarInfo[CONFIG.radarAt], rollcallId);
+              answerRadarRollcall(radarCoordinateOrder(rollcall), rollcallId);
               return;
             }
             if (rollcall.is_number) {
@@ -370,7 +470,11 @@ function solveSphereLeastSquaresDecimal(rawPoints) {
 }
 
 
-async function answerRadarRollcall(radarXY, rid) {
+/**
+ * @param {Array<[number, number]>} coords 有序的候选坐标，第一个是首选。
+ *        由 radarCoordinateOrder() 按「课表匹配 → 配置地点 → 其余信标」排好。
+ */
+async function answerRadarRollcall(coords, rid) {
 
   async function _req(lon, lat) {
     await gate();
@@ -400,23 +504,39 @@ async function answerRadarRollcall(radarXY, rid) {
       });
   }
 
-  let radar_outcome = [];
-
-  // Step 1: try configured location
-  if (radarXY) {
-    const outcome = await _req(radarXY[0], radarXY[1]);
-    console.log("[Autosign][Try Config]", radarXY, outcome);
-    if (outcome?.status_name === "on_call_fine") return true;
-    radar_outcome.push([radarXY, outcome]);
+  // 去重：配置地点本来就在 RadarInfo 表里，原来的写法会拿同一个坐标试两遍，
+  // 白白多一次可能触发 429 的请求。
+  const seen = new Set();
+  const queue = [];
+  for (const coord of coords ?? []) {
+    if (!Array.isArray(coord) || coord.length < 2) continue;
+    const key = `${coord[0]},${coord[1]}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    queue.push(coord);
   }
 
-  // Step 2: try all radar beacon points
-  for (const [key, value] of Object.entries(RadarInfo)) {
-    const outcome = await _req(value[0], value[1]);
-    console.log("[Autosign][Try Beacon]", key, value, outcome);
+  if (queue.length === 0) {
+    sendBoth(`[Autosign] 雷达签到 #${rid}：没有可用的签到地点，请检查 RadarInfo 配置`);
+    return false;
+  }
+
+  const radar_outcome = [];
+
+  // Step 1: 首选地点。通常就是课表匹配出来的那间教室——成了就只花 1 次请求。
+  const preferred = queue[0];
+  const preferredOutcome = await _req(preferred[0], preferred[1]);
+  console.log("[Autosign][Try Preferred]", preferred, preferredOutcome);
+  if (preferredOutcome?.status_name === "on_call_fine") return true;
+  radar_outcome.push([preferred, preferredOutcome]);
+
+  // Step 2: 其余信标逐个兜底
+  for (const coord of queue.slice(1)) {
+    const outcome = await _req(coord[0], coord[1]);
+    console.log("[Autosign][Try Beacon]", coord, outcome);
 
     if (outcome?.status_name === "on_call_fine") return true;
-    radar_outcome.push([value, outcome]);
+    radar_outcome.push([coord, outcome]);
   }
 
   // Step 3: spherical Nelder-Mead trilateration

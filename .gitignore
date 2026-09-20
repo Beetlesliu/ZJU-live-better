@@ -154,3 +154,6 @@ courses.zju/QA*.html
 .ddl-reminder-state.json
 .new-todo-state.json
 .reminder-state.json
+
+# 雷达签到用的教务网课表缓存（运行时生成）
+.schedule-state.json
